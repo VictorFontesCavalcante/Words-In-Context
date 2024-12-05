@@ -1,0 +1,8 @@
+[package]
+name = "words"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+regex = "1"
