@@ -1,9 +1,8 @@
 extern crate rusqlite;
 extern crate regex;
 
-use regex::Regex;
 use rusqlite::{params, Connection, Result as RusqliteResult};
-use std::fs::{File, read_dir};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Result as StdResult};
 
 #[allow(dead_code)]
@@ -30,16 +29,23 @@ fn create_tables(connection: &Connection) -> RusqliteResult<()> {
             name TEXT PRIMARY KEY
         );
 
-        CREATE TABLE IF NOT EXISTS words (
+        CREATE TABLE IF NOT EXISTS lines (
             position INTEGER,
-            word TEXT,
-            line INTEGER,
-            page INTEGER,
-            file_name TEXT,
-            PRIMARY KEY(position, file_name)
-            FOREIGN KEY(file_name) REFERENCES files(name)
+            content TEXT,
+            file_name TEXT, 
+            PRIMARY KEY (position, file_name),
+            FOREIGN KEY (file_name) REFERENCES files (name)
         );
-        ",
+
+        CREATE TABLE IF NOT EXISTS contexts (
+            position INTEGER,
+            line INTEGER,
+            content TEXT,
+            file_name TEXT,
+            PRIMARY KEY (position, line, file_name)
+            FOREIGN KEY (line, file_name) references lines (position, file_name)
+        );
+        "
     )?;
 
     Ok(())
@@ -48,34 +54,53 @@ fn create_tables(connection: &Connection) -> RusqliteResult<()> {
 fn load_file(name: &str, connection: &mut Connection) -> RusqliteResult<(), Error> {
     let file = File::open(name)?;
     let reader = BufReader::new(file);
+    let file_name = name.replace(".txt", "").replace("./Texts/", "");
 
     let tx = connection.transaction()?;
 
     tx.execute(
         "INSERT INTO files (name) VALUES (?1)",
-        params![name.replace(".txt", "").replace("./Texts/", "")],
+        params![file_name],
     )?;
-    
-    let regex = Regex::new(r"[^\p{L}\p{N}'’]+").unwrap();
+
     let mut line_index = 1;
-    let mut word_index = 1;
 
     for line_result in reader.lines() {
 
-        let line_content = regex.replace_all(&line_result?, " ").trim().to_string().to_lowercase();
-                
-        let words: Vec<&str> = line_content.split_whitespace().collect();
-        let page = (line_index as f32 / 46.0).floor() as i32 + 1;
+        let line_content = line_result?;
 
-        if words != [""] {
-            for word in words {
-                
+        tx.execute(
+            "INSERT INTO lines (position, content, file_name) VALUES (?1, ?2, ?3)",
+            params![line_index, line_content, file_name],
+        )?;
+        
+        let words = line_content.split_whitespace().map(|word| word.to_string()).collect();
+        let formatted_words = remove_stop_words(&words, &get_stop_words()?);
+
+        let size = words.len();
+
+        let mut context_index = 1;
+
+        for word in formatted_words.iter() {
+
+            let positions: Vec<usize> = words.iter().enumerate()
+                .filter_map(|(index, value)| if value == word {Some(index)} else {None}).collect();
+        
+            let clone = words.clone();
+
+            for position in positions {
+                let mut context = String::new();
+
+                for i in position..(position + size) {
+                    context.push_str(&(clone[i % size].to_owned() + " "));
+                }
+
                 tx.execute(
-                    "INSERT INTO words (position, word, line, page, file_name) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![word_index, word, line_index, page, name.replace(".txt", "").replace("./Texts/", "")],
+                    "INSERT INTO contexts (position, line, content, file_name) VALUES (?1, ?2, ?3, ?4)",
+                    params![context_index, line_index, context, file_name],
                 )?;
-                
-                word_index += 1;
+
+                context_index += 1;
             }
         }
         line_index += 1;
@@ -86,74 +111,71 @@ fn load_file(name: &str, connection: &mut Connection) -> RusqliteResult<(), Erro
     Ok(())
 }
 
-fn find_contexts(target_words: Vec<&str>, name: &str, connection: &Connection) -> RusqliteResult<Vec<String>, Error> {
-    let mut contexts: Vec<String> = vec![];
-    let mut case_words: Vec<String> = target_words.iter().map(|word| word.to_lowercase()).collect();
-    case_words.sort();
+fn get_contexts(name: &str, connection: &mut Connection) -> RusqliteResult<Vec<(String, String)>> {
+    let file_name = name.replace(".txt", "").replace("./Texts/", "");
+    let mut contexts: Vec<(String, String)> = vec![];
+    
+    let mut prepare = connection.prepare("
+                                                        SELECT lines.content AS line, contexts.content AS context 
+                                                        FROM lines 
+                                                        LEFT JOIN contexts ON contexts.line = lines.position 
+                                                        WHERE lines.file_name = (?1)"
+                                                        )?;
+    let mut query_result = prepare.query(params![file_name])?;
 
-    for search in case_words {
-
-        let mut prepare = connection.prepare("SELECT position, page FROM words WHERE word = (?1) AND file_name = (?2)")?;
-        let mut query_result = prepare.query(params![search, name])?;
-
-        while let Some(word) = query_result.next()? {
-
-            let position: i32 = word.get(0)?;
-            let page: i32 = word.get(1)?;
-            let mut context: Vec<String> = vec![];
-
-            let mut prepare = connection.prepare("SELECT word FROM words WHERE position in (?1, ?2, ?3, ?4, ?5) AND file_name = (?6)")?;
-            let mut query_result = prepare.query(params![position - 2, position - 1, position, position + 1, position + 2, name])?;
-
-            while let Some(word) = query_result.next()? {
-                let word_content: String = word.get(0)?;
-                context.push(word_content);
-            }
-
-            context.push(format!(": {}", page));
-            contexts.push(context.join(" "));
-        }
+    while let Some(row) = query_result.next()? {
+        contexts.push((row.get(0)?, row.get(1)?));
     }
 
-    return Ok(contexts)
+    contexts.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+    Ok(contexts)
 }
 
-fn get_texts() -> StdResult<Vec<String>> {
-    let mut file_names = Vec::new();
+fn get_stop_words() -> StdResult<Vec<String>> {
+    let mut stop_words = Vec::new();
 
-    for entry in read_dir("./Texts")? {
-        let path = entry?.path();
-        if let Some(file_name) = path.file_name() {
-            if let Some(file_str) = file_name.to_str() {
-                file_names.push("./Texts/".to_owned() + file_str);
+    if let Ok(file) = File::open("./Resources/stop_words.txt") {
+        for line in BufReader::new(file).lines() {
+            if let Ok(word) = line {
+                stop_words.push(word);
             }
         }
     }
-    Ok(file_names)
+
+    Ok(stop_words) 
+}
+
+fn remove_stop_words(string: &Vec<String>, stop_words: &Vec<String>) -> Vec<String> {
+    let mut formated_string: Vec<String> = vec![];
+
+    for word in string {
+        if !stop_words.contains(&word.to_lowercase()) {
+            formated_string.push(word.to_string());
+        }
+    }
+
+    return formated_string
 }
 
 fn main() -> RusqliteResult<(), Error>{
-    let texts = get_texts()?;
 
-    let target_file = String::from("Dom Casmurro");
-    let target_words = vec!["Dizer"];
+    let file = String::from("./Texts/The Quick Brown Fox.txt");
     let connection = Connection::open("Words in context.db")?;
 
     create_tables(&connection)?;
 
-    for file_name in texts {
-        let mut prepare = connection.prepare("SELECT * FROM files WHERE name = ?1")?;
-        let mut query_result = prepare.query(params![file_name.replace(".txt", "").replace("./Texts/", "")])?;
-        
-        let mut connection = Connection::open("Words in context.db")?;
+    let mut prepare = connection.prepare("SELECT name FROM files where name = (?1)")?;
+    let mut query_result = prepare.query(params![file.replace(".txt", "").replace("./Texts/", "")])?;
+    
+    let mut connection = Connection::open("Words in context.db")?;
 
-        if let None = query_result.next()? {
-            load_file(&file_name, &mut connection)?
-        }
+    if let None = query_result.next()? {
+        load_file(&file, &mut connection)?
     }
 
-    for context in find_contexts(target_words, &target_file, &connection)? {
-        println!("{}", context);
+    for (line, context) in get_contexts(&file, &mut connection)? {
+        println!("{} (from '{}') ", context, line);
     }
 
     Ok(())
