@@ -95,6 +95,8 @@ fn load_file(name: &str, connection: &mut Connection) -> RusqliteResult<(), Erro
                     context.push_str(&(clone[i % size].to_owned() + " "));
                 }
 
+                context.pop();
+
                 tx.execute(
                     "INSERT INTO contexts (position, line, content, file_name) VALUES (?1, ?2, ?3, ?4)",
                     params![context_index, line_index, context, file_name],
@@ -179,4 +181,138 @@ fn main() -> RusqliteResult<(), Error>{
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::fs::{File, remove_file};
+    use std::io::Write;
+
+    #[test]
+    fn test_remove_stop_words() {
+        let stop_words = vec!["the".to_string(), "a".to_string()];
+        let string = vec![
+            "The".to_string(),
+            "quick".to_string(),
+            "brown".to_string(),
+            "fox".to_string(),
+            "a".to_string(),
+            "brown".to_string(),
+            "cat".to_string(),
+            "sat".to_string()
+        ];
+
+        let result = remove_stop_words(&string, &stop_words);
+
+        assert_eq!(result, vec![
+            "quick".to_string(),
+            "brown".to_string(),
+            "fox".to_string(),
+            "brown".to_string(),
+            "cat".to_string(),
+            "sat".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn test_get_stop_words() {
+        let stop_words = get_stop_words().expect("Error reading stop words file");
+
+        assert!(stop_words.contains(&"the".to_string()));
+        assert!(stop_words.contains(&"who".to_string()));
+    }
+
+    #[test]
+    fn test_create_tables() {
+        let connection = Connection::open("test.db").expect("Error getting connection");
+
+        create_tables(&connection).expect("Error creating tables");
+
+        let query = connection.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |row| row.get::<usize, i64>(0),
+        ).expect("Error querying connection");
+
+        assert_eq!(query, 3);
+
+        remove_file("test.db").expect("Error removing file");
+    }
+
+    #[test]
+    fn test_load_file() {
+        let mut connection = Connection::open("test.db").expect("Error getting connection");
+
+        create_tables(&connection).expect("Error creating tables");
+
+        let file_name = "test.txt";
+
+        let mut file = File::create(file_name).expect("Error creating file");
+        write!(file, "The quick brown fox\nA brown cat sat\nThe cat is brown").expect("Error writing to file");
+
+        load_file(file_name, &mut connection).expect("Error loading file");
+
+        let query: Option<String> = connection.query_row(
+            "SELECT name FROM files WHERE name = ?1",
+            [file_name.replace("./Texts/", "").replace(".txt", "")],
+            |row| row.get(0),
+        ).expect("Error querying connection");
+
+        assert_eq!(query, Some(file_name.replace("./Texts/", "").replace(".txt", "")));
+
+        connection.close().expect("Error closing connection");
+
+        remove_file("test.db").expect("Error removing file");
+        remove_file(file_name).expect("Error removing file");
+    }
+
+    #[test]
+    fn test_get_contexts() {
+        let mut connection = Connection::open("test.db").expect("Error getting connection");
+
+        create_tables(&connection).expect("Error creating tables");
+        
+        let file_name = "test.txt";
+
+        let mut file = File::create(file_name).expect("Error creating file");
+        write!(file, "The quick brown fox").expect("Error writing to file");
+
+        load_file(file_name, &mut connection).expect("Error loading file");
+
+        let contexts = get_contexts(file_name, &mut connection).expect("Error getting contexts");
+
+        assert_eq!(contexts.len(), 3);
+
+        connection.close().expect("Error closing connection");
+
+        remove_file("test.db").expect("Error removing file");
+        remove_file(file_name).expect("Error removing file");
+    }
+
+    #[test]
+    fn test_check_contexts() {
+        let mut connection = Connection::open("test.db").expect("Error getting connection");
+
+        create_tables(&connection).expect("Error creating tables");
+        
+        let file_name = "test.txt";
+
+        let mut file = File::create(file_name).expect("Error creating file");
+        write!(file, "The quick brown fox").expect("Error writing to file");
+
+        load_file(file_name, &mut connection).expect("Error loading file");
+
+        let contexts = get_contexts(file_name, &mut connection).expect("Error getting contexts");
+
+        assert_eq!(contexts, vec![("The quick brown fox".to_string(), "brown fox The quick".to_string()),
+                                  ("The quick brown fox".to_string(), "fox The quick brown".to_string()),
+                                  ("The quick brown fox".to_string(), "quick brown fox The".to_string())]);
+
+        connection.close().expect("Error closing connection");
+
+        remove_file("test.db").expect("Error removing file");
+        remove_file(file_name).expect("Error removing file");
+    }
 }
